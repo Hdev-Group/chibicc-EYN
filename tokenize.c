@@ -1,5 +1,38 @@
 #include "chibicc.h"
 
+/*
+ * TOKEN POOL
+ *
+ * All Token structs are allocated from this static BSS pool rather than
+ * via individual calloc() calls.  Reasons:
+ *
+ *   1. Eliminates per-token malloc overhead (no block headers).
+ *   2. All slots are demand-zero via BSS — pages are only backed by
+ *      physical frames when first written, so unused capacity costs
+ *      nothing in RAM.
+ *   3. Token structs are never individually freed in chibicc; they live
+ *      for the entire compilation.  A bump pointer is therefore correct.
+ *
+ * Capacity: 750 000 × sizeof(Token) ≈ 54 MB of BSS virtual space (14 258
+ * virtual pages — safely below the 16 384-page ELF load limit in user_elf.c).
+ * Breakage if reduced below DOOM unity-build token count: token_alloc()
+ * calls error() and aborts compilation with a clear message.
+ */
+#define TOKEN_POOL_CAPACITY 750000
+static Token g_token_pool[TOKEN_POOL_CAPACITY];
+static int   g_token_pool_next;
+
+Token *token_alloc(void) {
+  if (g_token_pool_next >= TOKEN_POOL_CAPACITY)
+    error("[chibicc] token pool exhausted (capacity=%d); rebuild with larger TOKEN_POOL_CAPACITY",
+          TOKEN_POOL_CAPACITY);
+  /* Warn at 80%% capacity so the user can pre-empt exhaustion. */
+  if (g_token_pool_next == (TOKEN_POOL_CAPACITY * 8 / 10))
+    fprintf(stderr, "[chibicc] WARNING: token pool 80%% full (%d/%d)\n", g_token_pool_next, TOKEN_POOL_CAPACITY);
+  /* Tokens in the pool are zero-initialised by BSS demand-zero. */
+  return &g_token_pool[g_token_pool_next++];
+}
+
 // Input file
 static File *current_file;
 
@@ -98,7 +131,7 @@ bool consume(Token **rest, Token *tok, char *str) {
 
 // Create a new token.
 static Token *new_token(TokenKind kind, char *start, char *end) {
-  Token *tok = calloc(1, sizeof(Token));
+  Token *tok = token_alloc();
   tok->kind = kind;
   tok->loc = start;
   tok->len = end - start;
@@ -497,7 +530,14 @@ Token *tokenize(File *file) {
   at_bol = true;
   has_space = false;
 
+  int lex_tok_count = 0;
+
   while (*p) {
+    lex_tok_count++;
+    if (lex_tok_count % 10000 == 0)
+      fprintf(stderr, "[chibicc] lex: %d tokens so far in %s\n",
+              lex_tok_count, file->name);
+
     // Skip line comments.
     if (startswith(p, "//")) {
       p += 2;
@@ -776,7 +816,9 @@ static void convert_universal_chars(char *p) {
 }
 
 Token *tokenize_file(char *path) {
+  fprintf(stderr, "[chibicc] tokenize start: %s (pool=%d)\n", path, g_token_pool_next);
   char *p = read_file(path);
+  fprintf(stderr, "[chibicc] tokenize [1/4] read done: %s\n", path);
   if (!p)
     return NULL;
 
@@ -790,6 +832,7 @@ Token *tokenize_file(char *path) {
   canonicalize_newline(p);
   remove_backslash_newline(p);
   convert_universal_chars(p);
+  fprintf(stderr, "[chibicc] tokenize [2/4] preprocess done: %s\n", path);
 
   // Save the filename for assembler .file directive.
   static int file_no;
@@ -801,5 +844,8 @@ Token *tokenize_file(char *path) {
   input_files[file_no + 1] = NULL;
   file_no++;
 
-  return tokenize(file);
+  fprintf(stderr, "[chibicc] tokenize [3/4] lex start: %s\n", path);
+  Token *result = tokenize(file);
+  fprintf(stderr, "[chibicc] tokenize [4/4] lex done: %s (pool=%d)\n", path, g_token_pool_next);
+  return result;
 }

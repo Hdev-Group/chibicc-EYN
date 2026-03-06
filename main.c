@@ -666,8 +666,11 @@ static void cc1(void) {
   }
 
   // Tokenize and parse.
+  fprintf(stderr, "[chibicc] tokenizing: %s\n", base_file); fflush(stderr);
   Token *tok2 = must_tokenize_file(base_file);
   tok = append_tokens(tok, tok2);
+
+  fprintf(stderr, "[chibicc] preprocessing...\n"); fflush(stderr);
   tok = preprocess(tok);
 
   // If -M or -MD are given, print file dependencies.
@@ -683,7 +686,9 @@ static void cc1(void) {
     return;
   }
 
+  fprintf(stderr, "[chibicc] parsing AST...\n"); fflush(stderr);
   Obj *prog = parse(tok);
+  fprintf(stderr, "[chibicc] parse done, running codegen...\n"); fflush(stderr);
 
   // Open a temporary output buffer.
   char *buf;
@@ -694,10 +699,12 @@ static void cc1(void) {
   codegen(prog, output_buf);
   fclose(output_buf);
 
+  fprintf(stderr, "[chibicc] writing output: %s (%u bytes)\n", output_file, (unsigned)buflen); fflush(stderr);
   // Write the asembly text to a file.
   FILE *out = open_file(output_file);
   fwrite(buf, buflen, 1, out);
   fclose(out);
+  fprintf(stderr, "[chibicc] done.\n"); fflush(stderr);
 }
 
 static void assemble(char *input, char *output) {

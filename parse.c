@@ -3344,6 +3344,9 @@ Obj *parse(Token *tok) {
   declare_builtin_functions();
   globals = NULL;
 
+  int parse_fn_count = 0;
+  int parse_var_count = 0;
+
   while (tok->kind != TK_EOF) {
     VarAttr attr = {};
     Type *basety = declspec(&tok, tok, &attr);
@@ -3357,12 +3360,22 @@ Obj *parse(Token *tok) {
     // Function
     if (is_function(tok)) {
       tok = function(tok, basety, &attr);
+      parse_fn_count++;
+      if (parse_fn_count % 25 == 0) {
+        fprintf(stderr, "[chibicc] parsed %d functions, %d globals so far\n",
+                parse_fn_count, parse_var_count);
+        fflush(stderr);
+      }
       continue;
     }
 
     // Global variable
     tok = global_variable(tok, basety, &attr);
+    parse_var_count++;
   }
+  fprintf(stderr, "[chibicc] parse complete: %d functions, %d globals\n",
+          parse_fn_count, parse_var_count);
+  fflush(stderr);
 
   for (Obj *var = globals; var; var = var->next)
     if (var->is_root)

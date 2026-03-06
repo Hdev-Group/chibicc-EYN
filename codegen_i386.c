@@ -212,8 +212,14 @@ static void cast_i386(Type *from, Type *to) {
     return;
   }
 
-  if (from->kind == TY_LDOUBLE || to->kind == TY_LDOUBLE)
-    error("i386 backend: long double casts not supported");
+  // On i386, treat long double the same as double (both use x87 ST(0)).
+  // Reclassify TY_LDOUBLE to TY_DOUBLE for cast purposes.
+  Type from_adj = *from;
+  Type to_adj = *to;
+  if (from_adj.kind == TY_LDOUBLE) from_adj.kind = TY_DOUBLE;
+  if (to_adj.kind == TY_LDOUBLE) to_adj.kind = TY_DOUBLE;
+  from = &from_adj;
+  to = &to_adj;
 
   // Integer <-> float/double casts.
   if (!is_flonum(from) && is_flonum(to)) {
@@ -567,6 +573,41 @@ static void gen_expr(Node *node) {
   }
 
   case ND_FUNCALL: {
+    // Built-in alloca: inline stack allocation instead of calling a function.
+    // Shifts the temporary area (between ESP and alloca_bottom) down by `size`
+    // bytes, grows the stack, and returns a pointer to the newly allocated space.
+    if (node->lhs->kind == ND_VAR && !strcmp(node->lhs->var->name, "alloca")) {
+      gen_expr(node->args);  // size in %eax
+      // Align size to 16 bytes.
+      println("  add $15, %%eax");
+      println("  and $0xFFFFFFF0, %%eax");
+      println("  mov %%eax, %%edx");  // edx = aligned size (preserved)
+      // Compute byte count to relocate: count = alloca_bottom - esp.
+      println("  mov %d(%%ebp), %%ecx", current_fn->alloca_bottom->offset);
+      println("  sub %%esp, %%ecx");
+      // Save esi/edi for rep movsb.
+      println("  push %%esi");
+      println("  push %%edi");
+      // Source: old ESP (= current ESP + 8 because of the two pushes).
+      println("  lea 8(%%esp), %%esi");
+      // Dest: old ESP - size.
+      println("  mov %%esi, %%edi");
+      println("  sub %%edx, %%edi");
+      // Forward copy is safe (dest < source).
+      println("  cld");
+      println("  rep movsb");
+      // Restore esi/edi.
+      println("  pop %%edi");
+      println("  pop %%esi");
+      // Grow the stack.
+      println("  sub %%edx, %%esp");
+      // Update alloca_bottom and return its new value.
+      println("  mov %d(%%ebp), %%eax", current_fn->alloca_bottom->offset);
+      println("  sub %%edx, %%eax");
+      println("  mov %%eax, %d(%%ebp)", current_fn->alloca_bottom->offset);
+      return;
+    }
+
     // Evaluate arguments right-to-left and push.
     // For cdecl, by-value structs/unions are passed by copying bytes onto the stack.
     int stack_bytes = 0;
@@ -884,9 +925,17 @@ static void emit_data_i386(Obj *prog) {
 }
 
 static void emit_text_i386(Obj *prog) {
+  int codegen_fn_count = 0;
   for (Obj *fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition)
       continue;
+
+    codegen_fn_count++;
+    if (codegen_fn_count % 25 == 0) {
+      fprintf(stderr, "[chibicc] codegen: %d functions emitted (current: %s)\n",
+              codegen_fn_count, fn->name);
+      fflush(stderr);
+    }
 
     current_fn = fn;
 

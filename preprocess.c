@@ -90,7 +90,7 @@ static Token *skip_line(Token *tok) {
 }
 
 static Token *copy_token(Token *tok) {
-  Token *t = calloc(1, sizeof(Token));
+  Token *t = token_alloc();
   *t = *tok;
   t->next = NULL;
   return t;
@@ -150,16 +150,27 @@ static Token *add_hideset(Token *tok, Hideset *hs) {
 
 // Append tok2 to the end of tok1.
 static Token *append(Token *tok1, Token *tok2) {
+  /*
+   * Splice tok2 onto the end of tok1's chain in-place, without copying.
+   *
+   * The original implementation copied every token in tok1, which was O(n)
+   * allocations per include processed by preprocess2.  With hundreds of
+   * #includes in a unity build, the total cost was O(n²) in both time and
+   * heap space, causing heap exhaustion and swap pressure on low-RAM configs.
+   *
+   * Safety: every caller passes a freshly-allocated token list for tok1
+   * (from tokenize_file → add_hideset / subst → add_hideset), so mutating
+   * the tail pointer does not alias any live chain.
+   */
   if (tok1->kind == TK_EOF)
     return tok2;
 
-  Token head = {};
-  Token *cur = &head;
-
-  for (; tok1->kind != TK_EOF; tok1 = tok1->next)
-    cur = cur->next = copy_token(tok1);
-  cur->next = tok2;
-  return head.next;
+  /* Walk to the last non-EOF token and replace its EOF successor with tok2. */
+  Token *t = tok1;
+  while (t->next && t->next->kind != TK_EOF)
+    t = t->next;
+  t->next = tok2;
+  return tok1;
 }
 
 static Token *skip_cond_incl2(Token *tok) {
@@ -841,7 +852,19 @@ static Token *preprocess2(Token *tok) {
   Token head = {};
   Token *cur = &head;
 
+  static long pp_token_count = 0;
+  static long pp_next_report = 10000;
+  static int  pp_include_count = 0;
+
   while (tok->kind != TK_EOF) {
+    // Progress counter: print every 10000 tokens so the user can see activity.
+    pp_token_count++;
+    if (pp_token_count >= pp_next_report) {
+      fprintf(stderr, "[chibicc] preprocessing: %ld tokens, %d includes\n",
+              pp_token_count, pp_include_count);
+      pp_next_report += 10000;
+    }
+
     // If it is a macro, expand it.
     if (expand_macro(&tok, tok))
       continue;
@@ -865,12 +888,17 @@ static Token *preprocess2(Token *tok) {
       if (filename[0] != '/' && is_dquote) {
         char *path = format("%s/%s", dirname(strdup(start->file->name)), filename);
         if (file_exists(path)) {
+          pp_include_count++;
+          fprintf(stderr, "[chibicc] #include %s (%d)\n", path, pp_include_count);
           tok = include_file(tok, path, start->next->next);
           continue;
         }
       }
 
       char *path = search_include_paths(filename);
+      pp_include_count++;
+      fprintf(stderr, "[chibicc] #include %s (%d)\n",
+              path ? path : filename, pp_include_count);
       tok = include_file(tok, path ? path : filename, start->next->next);
       continue;
     }

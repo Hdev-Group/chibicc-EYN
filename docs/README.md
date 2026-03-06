@@ -2,13 +2,13 @@
 
 This directory documents the EYN-OS-focused fork of **chibicc**.
 
-Design goal: keep the compiler **self-contained** and usable as its own repository.
-EYN-OS integration (building `.uelf`, CRT, libc, disk image deployment) should remain **optional** and live outside the compiler where possible.
+Design goal: keep the compiler **self-contained** and produce runnable EYN-OS
+ring3 executables (`.uelf`) directly, without any external assembler or linker.
 
 ## Documentation Structure
 
 ### Getting Started
-- **[EYN-OS Target](target-eynos.md)** - `-target eynos`, sysroot, predefined macros, and include paths
+- **[EYN-OS Target](target-eynos.md)** - `-target eynos`, sysroot, predefined macros, include paths, and supported features
 - **[Build & Development](development.md)** - building the compiler, sanity checks, and conventions for this fork
 
 ## Quick Start (Host Build)
@@ -21,35 +21,42 @@ make -j
 
 This builds the `chibicc` binary.
 
-## How `.uelf` Builds Fit In (When Used With EYN-OS)
+## How `.uelf` Builds Work
 
-This compiler emits `.o`/`.s`. Producing an EYN-OS ring3 executable (`.uelf`) is a **separate** link step using EYN-OS’s CRT + libc + linker script.
-
-Pipeline:
+When `-target eynos` is used, chibicc drives a fully integrated pipeline that
+produces a runnable EYN-OS ring3 executable (`.uelf`) without any external tools:
 
 ```
   app.c
     |
-    |  chibicc  (-target eynos)
+    |  chibicc -target eynos  (tokenize -> preprocess -> parse -> codegen)
     v
-  app.o
+  AT&T assembly (temp file)
     |
-    |  i686-elf-gcc/gcc + EYN-OS CRT + libc + user_elf32.ld
+    |  eynos_as  (built-in GAS->Intel translator + x86 binary assembler)
     v
-  app.uelf
+  machine code + data + BSS metadata
+    |
+    |  eynos_linker  (built-in ELF32 ET_EXEC writer)
+    v
+  app.uelf  (loadable EYN-OS ring3 executable)
     |
     |  copied into EYNFS image
     v
   run inside EYN-OS (ring3)
 ```
 
-In the EYN-OS monorepo, the wrapper script lives at:
+The assembler automatically injects required runtime stubs (CRT `_start` shim,
+system-call wrappers `eyn_syscall3` / `eyn_syscall1` / `eyn_syscall0`, and
+optional helpers such as `getdents`, `writefile`) when the compiled source
+references them by name.
+
+In the EYN-OS monorepo the wrapper script lives at:
 - `devtools/build_user_c_chibicc.sh`
 
-In a standalone fork, you can provide your own wrapper or build system.
+In a standalone fork you can invoke chibicc directly with `-target eynos`.
 
 ## Non-Goals (For Now)
 
-- No native linker integration for EYN-OS inside chibicc
 - No attempt to consume host `/usr/include` when targeting EYN-OS
 - No "mixing" kernel headers into user programs

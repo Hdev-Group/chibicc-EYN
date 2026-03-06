@@ -139,6 +139,7 @@ typedef struct {
 
   eynos_link_section_t text;
   eynos_link_section_t rodata;
+  uint32_t bss_size;   /* Appended to rodata (data) segment as zero-fill (p_memsz > p_filesz). */
 
   eynos_link_symbol_t symbols[EYNOS_LINK_MAX_SYMBOLS];
   int symbol_count;

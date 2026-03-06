@@ -402,6 +402,7 @@ static void split_operands(const char *s, char *op0, size_t op0sz, char *op1, si
 
 // Forward declarations (helpers are defined later in this TU)
 static int eynas_get_reg_encoding(const char *reg);
+static int eynas_get_reg16_encoding(const char *reg);
 static int eynas_is_reg8(const char *r);
 
 static bool eynas_is_jcc_mnemonic(const char *mn) {
@@ -439,17 +440,19 @@ static void emit_operand_intel(sbuf_t *out, const char *op_in, int size_hint_bit
     if (size_hint_bits == 8) sbuf_puts(out, "byte ");
     if (size_hint_bits == 16) sbuf_puts(out, "word ");
     if (size_hint_bits == 32) sbuf_puts(out, "dword ");
+    if (size_hint_bits == 64) sbuf_puts(out, "qword ");
     translate_mem_operand(out, tmp);
     return;
   }
 
   // if caller requests a size hint and operand looks like memory already (e.g. label)
   if (size_hint_bits && (isalpha((unsigned char)tmp[0]) || tmp[0] == '_' || tmp[0] == '.') &&
-      eynas_get_reg_encoding(tmp) < 0 && !eynas_is_reg8(tmp)) {
+      eynas_get_reg_encoding(tmp) < 0 && eynas_get_reg16_encoding(tmp) < 0 && !eynas_is_reg8(tmp)) {
     // Heuristic: when used in movzx/movsx source, treat as memory.
     if (size_hint_bits == 8) sbuf_puts(out, "byte ");
     if (size_hint_bits == 16) sbuf_puts(out, "word ");
     if (size_hint_bits == 32) sbuf_puts(out, "dword ");
+    if (size_hint_bits == 64) sbuf_puts(out, "qword ");
     sbuf_putc(out, '[');
     sbuf_puts(out, tmp);
     sbuf_putc(out, ']');
@@ -508,6 +511,7 @@ static void translate_line(sbuf_t *out, const char *line) {
   if (*s == '.') {
     if (starts_with(s, ".text")) { emit_section(out, ".text"); return; }
     if (starts_with(s, ".data")) { emit_section(out, ".data"); return; }
+    if (starts_with(s, ".bss"))  { emit_section(out, ".bss"); return; }
     if (starts_with(s, ".section")) {
       // .section .rodata
       const char *p = s + strlen(".section");
@@ -600,9 +604,43 @@ static void translate_line(sbuf_t *out, const char *line) {
       return;
     }
 
+    if (starts_with(s, ".comm")) {
+      // .comm name, size[, align]
+      const char *p = s + 5;
+      while (*p == ' ' || *p == '\t') p++;
+      char cname[64]; int ni = 0;
+      while (*p && *p != ',' && *p != ' ' && *p != '\t' && ni < 63)
+        cname[ni++] = *p++;
+      cname[ni] = '\0';
+      while (*p && *p != ',') p++;
+      if (*p == ',') p++;
+      while (*p == ' ' || *p == '\t') p++;
+      char csize[32]; int si = 0;
+      while (*p && *p != ',' && *p != ' ' && *p != '\t' && si < 31)
+        csize[si++] = *p++;
+      csize[si] = '\0';
+      char calign[16] = "4";
+      while (*p && *p != ',') p++;
+      if (*p == ',') {
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        int ai = 0;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && ai < 15)
+          calign[ai++] = *p++;
+        calign[ai] = '\0';
+      }
+      // Emit: section .bss / align N / name: / resb size
+      sbuf_puts(out, "section .bss\n");
+      sbuf_puts(out, "align "); sbuf_puts(out, calign); sbuf_puts(out, "\n");
+      sbuf_puts(out, cname); sbuf_puts(out, ":\n");
+      sbuf_puts(out, "resb "); sbuf_puts(out, csize);
+      emit_newline(out);
+      return;
+    }
+
     if (starts_with(s, ".file") || starts_with(s, ".type") || starts_with(s, ".size") ||
         starts_with(s, ".ident") || starts_with(s, ".p2align") || starts_with(s, ".local") ||
-        starts_with(s, ".comm") || starts_with(s, ".section")) {
+        starts_with(s, ".section")) {
       // ignore these for now
       emit_newline(out);
       return;
@@ -726,7 +764,8 @@ static void translate_line(sbuf_t *out, const char *line) {
   }
 
   if (!strcmp(mn, "add") || !strcmp(mn, "sub") || !strcmp(mn, "and") || !strcmp(mn, "or") ||
-      !strcmp(mn, "xor") || !strcmp(mn, "cmp") || !strcmp(mn, "test")) {
+      !strcmp(mn, "xor") || !strcmp(mn, "cmp") || !strcmp(mn, "test") ||
+      !strcmp(mn, "shl") || !strcmp(mn, "shr") || !strcmp(mn, "sar") || !strcmp(mn, "sal")) {
     emit_binop_swapped(out, mn, p);
     return;
   }
@@ -768,6 +807,69 @@ static void translate_line(sbuf_t *out, const char *line) {
     }
     emit_newline(out);
     return;
+  }
+
+  // ---------------------------------------------------------------
+  // FPU instructions — translate AT&T syntax to Intel syntax
+  // ---------------------------------------------------------------
+
+  // No-operand FPU: fchs, fucompp
+  if (!strcmp(mn, "fchs") || !strcmp(mn, "fucompp")) {
+    sbuf_puts(out, mn);
+    emit_newline(out);
+    return;
+  }
+
+  // FPU arithmetic with implicit st(0),st(1): strip operands
+  if (!strcmp(mn, "faddp") || !strcmp(mn, "fsubp") ||
+      !strcmp(mn, "fmulp") || !strcmp(mn, "fdivp")) {
+    sbuf_puts(out, mn);
+    emit_newline(out);
+    return;
+  }
+
+  // sahf (flags load from AH)
+  if (!strcmp(mn, "sahf")) {
+    sbuf_puts(out, "sahf");
+    emit_newline(out);
+    return;
+  }
+
+  // fnstsw %ax → fnstsw ax
+  if (!strcmp(mn, "fnstsw")) {
+    sbuf_puts(out, "fnstsw ax");
+    emit_newline(out);
+    return;
+  }
+
+  // fstp %st(0) → fstp st0
+  if (!strcmp(mn, "fstp") && *p == '%') {
+    sbuf_puts(out, "fstp st0");
+    emit_newline(out);
+    return;
+  }
+
+  // FPU memory instructions: map AT&T mnemonics to Intel + size prefix
+  {
+    static const struct { const char *atandt; const char *intel; int hint; } fpu_mem_map[] = {
+      {"flds",   "fld",   32}, {"fldl",   "fld",   64},
+      {"fsts",   "fst",   32}, {"fstl",   "fst",   64},
+      {"fstps",  "fstp",  32}, {"fstpl",  "fstp",  64},
+      {"fildl",  "fild",  32},
+      {"fistpl", "fistp", 32},
+      {"fnstcw", "fnstcw", 16},
+      {"fldcw",  "fldcw",  16},
+      {NULL, NULL, 0}
+    };
+    for (int i = 0; fpu_mem_map[i].atandt; i++) {
+      if (!strcmp(mn, fpu_mem_map[i].atandt)) {
+        sbuf_puts(out, fpu_mem_map[i].intel);
+        sbuf_putc(out, ' ');
+        emit_operand_intel(out, p, fpu_mem_map[i].hint);
+        emit_newline(out);
+        return;
+      }
+    }
   }
 
   // Fallback: emit mnemonic and raw operands after removing %/$/* where reasonable.
@@ -830,6 +932,7 @@ typedef enum {
   EYNAS_SECTION_NONE = 0,
   EYNAS_SECTION_TEXT,
   EYNAS_SECTION_DATA,
+  EYNAS_SECTION_BSS,
 } eynas_section_t;
 
 typedef enum {
@@ -944,6 +1047,7 @@ typedef struct {
 
 // Register encodings
 static const char *eynas_reg_names[] = {"eax","ecx","edx","ebx","esp","ebp","esi","edi"};
+static const char *eynas_reg16_names[] = {"ax","cx","dx","bx","sp","bp","si","di"};
 static const char *eynas_reg8_names[] = {"al","cl","dl","bl","ah","ch","dh","bh"};
 static const char *eynas_seg_reg_names[] = {"es","cs","ss","ds","fs","gs"};
 
@@ -976,6 +1080,9 @@ static const eynas_instinfo_t eynas_arith_insts[] = {
   {"imul", 0xF6, 1, 0, 0, INST_CAT_ARITHMETIC, NULL},
   {"imul", 0x69, 1, 1, 0, INST_CAT_ARITHMETIC, NULL},
   {"idiv", 0xF6, 1, 0, 0, INST_CAT_ARITHMETIC, NULL},
+  {"div", 0xF6, 1, 0, 0, INST_CAT_ARITHMETIC, NULL},
+  {"mul", 0xF6, 1, 0, 0, INST_CAT_ARITHMETIC, NULL},
+  {"neg", 0xF6, 1, 0, 0, INST_CAT_ARITHMETIC, NULL},
   {"cmp", 0x38, 1, 0, 0, INST_CAT_ARITHMETIC, NULL},
   {"cmp", 0x80, 1, 1, 0, INST_CAT_ARITHMETIC, NULL},
   {NULL,0,0,0,0,0,NULL}
@@ -1042,6 +1149,25 @@ static const eynas_instinfo_t eynas_system_insts[] = {
   {NULL,0,0,0,0,0,NULL}
 };
 
+static const eynas_instinfo_t eynas_fpu_insts[] = {
+  {"fld",     0xD9, 1, 0, 0, INST_CAT_FPU, NULL},
+  {"fst",     0xD9, 1, 0, 0, INST_CAT_FPU, NULL},
+  {"fstp",    0xD9, 1, 0, 0, INST_CAT_FPU, NULL},
+  {"fild",    0xDB, 1, 0, 0, INST_CAT_FPU, NULL},
+  {"fistp",   0xDB, 1, 0, 0, INST_CAT_FPU, NULL},
+  {"faddp",   0xDE, 0, 0, 0, INST_CAT_FPU, NULL},
+  {"fsubp",   0xDE, 0, 0, 0, INST_CAT_FPU, NULL},
+  {"fmulp",   0xDE, 0, 0, 0, INST_CAT_FPU, NULL},
+  {"fdivp",   0xDE, 0, 0, 0, INST_CAT_FPU, NULL},
+  {"fchs",    0xD9, 0, 0, 0, INST_CAT_FPU, NULL},
+  {"fucompp", 0xDA, 0, 0, 0, INST_CAT_FPU, NULL},
+  {"fnstsw",  0xDF, 0, 0, 0, INST_CAT_FPU, NULL},
+  {"fnstcw",  0xD9, 1, 0, 0, INST_CAT_FPU, NULL},
+  {"fldcw",   0xD9, 1, 0, 0, INST_CAT_FPU, NULL},
+  {"sahf",    0x9E, 0, 0, 0, INST_CAT_FPU, NULL},
+  {NULL,0,0,0,0,0,NULL}
+};
+
 static const eynas_instinfo_t *eynas_find_inst(const char *mnemonic) {
   const eynas_instinfo_t *tables[] = {
     eynas_data_movement_insts,
@@ -1050,6 +1176,7 @@ static const eynas_instinfo_t *eynas_find_inst(const char *mnemonic) {
     eynas_cf_insts,
     eynas_string_insts,
     eynas_system_insts,
+    eynas_fpu_insts,
   };
 
   // Exact match first.
@@ -1102,6 +1229,13 @@ static int eynas_get_reg_encoding(const char *reg) {
   return -1;
 }
 
+static int eynas_get_reg16_encoding(const char *reg) {
+  for (int i = 0; i < 8; i++)
+    if (!strcmp(reg, eynas_reg16_names[i]))
+      return i;
+  return -1;
+}
+
 static int eynas_get_reg8_encoding(const char *reg) {
   for (int i = 0; i < 8; i++)
     if (!strcmp(reg, eynas_reg8_names[i]))
@@ -1111,10 +1245,14 @@ static int eynas_get_reg8_encoding(const char *reg) {
 
 static int eynas_is_valid_register(const char *name) {
   if (eynas_get_reg_encoding(name) >= 0) return 1;
+  if (eynas_get_reg16_encoding(name) >= 0) return 1;
   if (eynas_get_reg8_encoding(name) >= 0) return 1;
   for (int i = 0; i < 6; i++)
     if (!strcmp(name, eynas_seg_reg_names[i]))
       return 1;
+  // x87 stack register (used by fstp st0)
+  if (!strcmp(name, "st0"))
+    return 1;
   return 0;
 }
 
@@ -1217,7 +1355,7 @@ static eynas_token_t eynas_next_token(eynas_lexer_t *lx) {
     memcpy(tok.text, src + start, id_len);
     tok.text[id_len] = 0;
 
-    if (!strcmp(tok.text, "byte") || !strcmp(tok.text, "word") || !strcmp(tok.text, "dword")) {
+    if (!strcmp(tok.text, "byte") || !strcmp(tok.text, "word") || !strcmp(tok.text, "dword") || !strcmp(tok.text, "qword")) {
       tok.type = EYNAS_TOK_SIZE;
       lx->pos = pos;
       return tok;
@@ -1646,6 +1784,16 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
     return;
   }
 
+  // call/jmp reg (indirect through register): FF /2 or FF /4
+  if ((!strcmp(info->mnemonic, "call") || !strcmp(info->mnemonic, "jmp")) && a->type == EYNAS_OPERAND_REGISTER) {
+    int reg = eynas_get_reg_encoding(a->value);
+    if (reg < 0) error("unknown register: %s", a->value);
+    uint8_t ext = !strcmp(info->mnemonic, "call") ? 2 : 4;
+    eynas_emit_u8(code, code_len, code_cap, 0xFF);
+    eynas_emit_modrm(code, code_len, code_cap, 3, ext, (uint8_t)reg);
+    return;
+  }
+
   // jcc (always encode near/rel32 form)
   // This avoids needing multi-pass branch relaxation.
   if (eynas_is_jcc_mnemonic(info->mnemonic)) {
@@ -1956,14 +2104,25 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
     return;
   }
 
-  // mov reg, [mem]
+  // mov reg, [mem] (32-bit, 16-bit, or 8-bit register)
   if (!strcmp(info->mnemonic, "mov") && a->type == EYNAS_OPERAND_REGISTER && b->type == EYNAS_OPERAND_MEMORY) {
     int dst = eynas_get_reg_encoding(a->value);
+    int is_16bit = 0, is_8bit = 0;
+    if (dst < 0) {
+      dst = eynas_get_reg16_encoding(a->value);
+      if (dst >= 0) is_16bit = 1;
+    }
+    if (dst < 0) {
+      dst = eynas_get_reg8_encoding(a->value);
+      if (dst >= 0) is_8bit = 1;
+    }
+    if (dst < 0) error("unknown register: %s", a->value);
     int has_base, base, has_index, index, scale, disp;
     char label[64];
     eynas_parse_mem(b->value, &has_base, &base, &has_index, &index, &scale, &disp, label, sizeof(label));
 
-    eynas_emit_u8(code, code_len, code_cap, 0x8B);
+    if (is_16bit) eynas_emit_u8(code, code_len, code_cap, 0x66);
+    eynas_emit_u8(code, code_len, code_cap, is_8bit ? 0x8A : 0x8B);
 
     if (label[0]) {
       int addr = eynas_symtab_lookup(symtab, label, EYNAS_SECTION_DATA);
@@ -2000,14 +2159,25 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
     return;
   }
 
-  // mov [mem], reg
+  // mov [mem], reg (32-bit, 16-bit, or 8-bit register)
   if (!strcmp(info->mnemonic, "mov") && a->type == EYNAS_OPERAND_MEMORY && b->type == EYNAS_OPERAND_REGISTER) {
     int src = eynas_get_reg_encoding(b->value);
+    int is_16bit = 0, is_8bit = 0;
+    if (src < 0) {
+      src = eynas_get_reg16_encoding(b->value);
+      if (src >= 0) is_16bit = 1;
+    }
+    if (src < 0) {
+      src = eynas_get_reg8_encoding(b->value);
+      if (src >= 0) is_8bit = 1;
+    }
+    if (src < 0) error("unknown register: %s", b->value);
     int has_base, base, has_index, index, scale, disp;
     char label[64];
     eynas_parse_mem(a->value, &has_base, &base, &has_index, &index, &scale, &disp, label, sizeof(label));
 
-    eynas_emit_u8(code, code_len, code_cap, 0x89);
+    if (is_16bit) eynas_emit_u8(code, code_len, code_cap, 0x66);
+    eynas_emit_u8(code, code_len, code_cap, is_8bit ? 0x88 : 0x89);
 
     if (label[0]) {
       int addr = eynas_symtab_lookup(symtab, label, EYNAS_SECTION_DATA);
@@ -2113,6 +2283,12 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
        !strcmp(info->mnemonic, "and") || !strcmp(info->mnemonic, "or") || !strcmp(info->mnemonic, "cmp")) &&
       a->type == EYNAS_OPERAND_REGISTER && b->type == EYNAS_OPERAND_IMMEDIATE) {
     int dst = eynas_get_reg_encoding(a->value);
+    int is_16bit = 0;
+    if (dst < 0) {
+      dst = eynas_get_reg16_encoding(a->value);
+      if (dst >= 0) is_16bit = 1;
+    }
+    if (dst < 0) error("unknown register: %s", a->value);
     uint32_t imm = 0;
     if (eynas_parse_imm32(b->value, &imm) != 0)
       error("invalid immediate");
@@ -2125,7 +2301,13 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
     else if (!strcmp(info->mnemonic, "xor")) ext = 6;
     else if (!strcmp(info->mnemonic, "cmp")) ext = 7;
 
-    if ((int32_t)imm >= -128 && (int32_t)imm <= 127) {
+    if (is_16bit) {
+      // 16-bit operand size prefix + 0x81 /ext iw
+      eynas_emit_u8(code, code_len, code_cap, 0x66);
+      eynas_emit_u8(code, code_len, code_cap, 0x81);
+      eynas_emit_modrm(code, code_len, code_cap, 3, ext, (uint8_t)dst);
+      eynas_emit_u16(code, code_len, code_cap, (uint16_t)imm);
+    } else if ((int32_t)imm >= -128 && (int32_t)imm <= 127) {
       eynas_emit_u8(code, code_len, code_cap, 0x83);
       eynas_emit_modrm(code, code_len, code_cap, 3, ext, (uint8_t)dst);
       eynas_emit_u8(code, code_len, code_cap, (uint8_t)imm);
@@ -2164,6 +2346,24 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
     return;
   }
 
+  // not/neg/div/idiv/mul reg  (F7 /ext)
+  if ((!strcmp(info->mnemonic, "not") || !strcmp(info->mnemonic, "neg") ||
+       !strcmp(info->mnemonic, "div") || !strcmp(info->mnemonic, "idiv") ||
+       !strcmp(info->mnemonic, "mul")) &&
+      a->type == EYNAS_OPERAND_REGISTER && b->type == EYNAS_OPERAND_NONE) {
+    int reg = eynas_get_reg_encoding(a->value);
+    if (reg < 0) error("unknown register: %s", a->value);
+    uint8_t ext = 0;
+    if (!strcmp(info->mnemonic, "not"))  ext = 2;
+    else if (!strcmp(info->mnemonic, "neg"))  ext = 3;
+    else if (!strcmp(info->mnemonic, "mul"))  ext = 4;
+    else if (!strcmp(info->mnemonic, "div"))  ext = 6;
+    else if (!strcmp(info->mnemonic, "idiv")) ext = 7;
+    eynas_emit_u8(code, code_len, code_cap, 0xF7);
+    eynas_emit_modrm(code, code_len, code_cap, 3, ext, (uint8_t)reg);
+    return;
+  }
+
   // movzx/movsx reg32, r/m8|r/m16
   if ((!strcmp(info->mnemonic, "movzx") || !strcmp(info->mnemonic, "movsx")) &&
       a->type == EYNAS_OPERAND_REGISTER) {
@@ -2171,12 +2371,20 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
 
     int is_zx = !strcmp(info->mnemonic, "movzx");
 
-    // Operand b is either register8 or memory with size hint.
+    // Operand b is either register8, register16, or memory with size hint.
     if (b->type == EYNAS_OPERAND_REGISTER && eynas_is_reg8(b->value)) {
       int src8 = eynas_get_reg8_encoding(b->value);
       eynas_emit_u8(code, code_len, code_cap, 0x0F);
       eynas_emit_u8(code, code_len, code_cap, is_zx ? 0xB6 : 0xBE);
       eynas_emit_modrm(code, code_len, code_cap, 3, (uint8_t)dst, (uint8_t)src8);
+      return;
+    }
+
+    if (b->type == EYNAS_OPERAND_REGISTER && eynas_get_reg16_encoding(b->value) >= 0) {
+      int src16 = eynas_get_reg16_encoding(b->value);
+      eynas_emit_u8(code, code_len, code_cap, 0x0F);
+      eynas_emit_u8(code, code_len, code_cap, is_zx ? 0xB7 : 0xBF);
+      eynas_emit_modrm(code, code_len, code_cap, 3, (uint8_t)dst, (uint8_t)src16);
       return;
     }
 
@@ -2277,6 +2485,103 @@ static void eynas_encode_inst(const eynas_instinfo_t *info, const eynas_instruct
       eynas_emit_sib(code, code_len, code_cap, (uint8_t)scale, sib_index, sib_base);
     } else {
       eynas_emit_modrm(code, code_len, code_cap, mod, (uint8_t)dst, rm);
+    }
+
+    if (mod == 1)
+      eynas_emit_u8(code, code_len, code_cap, (uint8_t)disp);
+    else if (mod == 2 || (mod == 0 && base == 5))
+      eynas_emit_u32(code, code_len, code_cap, (uint32_t)disp);
+
+    return;
+  }
+
+  // ---------------------------------------------------------------
+  // FPU instructions
+  // ---------------------------------------------------------------
+
+  // Zero-operand FPU (fixed 2-byte encodings)
+  if (!strcmp(info->mnemonic, "faddp"))   { eynas_emit_u8(code, code_len, code_cap, 0xDE); eynas_emit_u8(code, code_len, code_cap, 0xC1); return; }
+  if (!strcmp(info->mnemonic, "fsubp"))   { eynas_emit_u8(code, code_len, code_cap, 0xDE); eynas_emit_u8(code, code_len, code_cap, 0xE9); return; }
+  if (!strcmp(info->mnemonic, "fmulp"))   { eynas_emit_u8(code, code_len, code_cap, 0xDE); eynas_emit_u8(code, code_len, code_cap, 0xC9); return; }
+  if (!strcmp(info->mnemonic, "fdivp"))   { eynas_emit_u8(code, code_len, code_cap, 0xDE); eynas_emit_u8(code, code_len, code_cap, 0xF9); return; }
+  if (!strcmp(info->mnemonic, "fchs"))    { eynas_emit_u8(code, code_len, code_cap, 0xD9); eynas_emit_u8(code, code_len, code_cap, 0xE0); return; }
+  if (!strcmp(info->mnemonic, "fucompp")) { eynas_emit_u8(code, code_len, code_cap, 0xDA); eynas_emit_u8(code, code_len, code_cap, 0xE9); return; }
+  if (!strcmp(info->mnemonic, "sahf"))    { eynas_emit_u8(code, code_len, code_cap, 0x9E); return; }
+
+  // fnstsw ax: DF E0
+  if (!strcmp(info->mnemonic, "fnstsw"))  { eynas_emit_u8(code, code_len, code_cap, 0xDF); eynas_emit_u8(code, code_len, code_cap, 0xE0); return; }
+
+  // fstp st0: DD D8
+  if (!strcmp(info->mnemonic, "fstp") && a->type == EYNAS_OPERAND_REGISTER) {
+    eynas_emit_u8(code, code_len, code_cap, 0xDD);
+    eynas_emit_u8(code, code_len, code_cap, 0xD8);
+    return;
+  }
+
+  // FPU memory instructions: opcode + ModRM with /ext digit
+  // fld:   dword=D9/0  qword=DD/0
+  // fst:   dword=D9/2  qword=DD/2
+  // fstp:  dword=D9/3  qword=DD/3
+  // fild:  dword=DB/0
+  // fistp: dword=DB/3
+  // fnstcw: D9/7 (word memory)
+  // fldcw:  D9/5 (word memory)
+  if ((!strcmp(info->mnemonic, "fld")  || !strcmp(info->mnemonic, "fst")  ||
+       !strcmp(info->mnemonic, "fstp") || !strcmp(info->mnemonic, "fild") ||
+       !strcmp(info->mnemonic, "fistp")|| !strcmp(info->mnemonic, "fnstcw") ||
+       !strcmp(info->mnemonic, "fldcw")) && a->type == EYNAS_OPERAND_MEMORY) {
+
+    // Determine opcode byte and /ext digit
+    uint8_t opcode;
+    uint8_t ext;
+    int hint = a->size_hint ? a->size_hint : 32;
+
+    if (!strcmp(info->mnemonic, "fld")) {
+      opcode = (hint == 64) ? 0xDD : 0xD9; ext = 0;
+    } else if (!strcmp(info->mnemonic, "fst")) {
+      opcode = (hint == 64) ? 0xDD : 0xD9; ext = 2;
+    } else if (!strcmp(info->mnemonic, "fstp")) {
+      opcode = (hint == 64) ? 0xDD : 0xD9; ext = 3;
+    } else if (!strcmp(info->mnemonic, "fild")) {
+      opcode = 0xDB; ext = 0;
+    } else if (!strcmp(info->mnemonic, "fistp")) {
+      opcode = 0xDB; ext = 3;
+    } else if (!strcmp(info->mnemonic, "fnstcw")) {
+      opcode = 0xD9; ext = 7;
+    } else /* fldcw */ {
+      opcode = 0xD9; ext = 5;
+    }
+
+    eynas_emit_u8(code, code_len, code_cap, opcode);
+
+    // Encode ModRM+SIB+disp for the memory operand
+    int has_base = 0, base = 0, has_index = 0, index = 0, scale = 0, disp = 0;
+    char label[64];
+    label[0] = 0;
+    eynas_parse_mem(a->value, &has_base, &base, &has_index, &index, &scale, &disp, label, sizeof(label));
+
+    if (label[0]) {
+      int addr = eynas_symtab_lookup(symtab, label, EYNAS_SECTION_DATA);
+      if (addr < 0) addr = eynas_symtab_lookup(symtab, label, EYNAS_SECTION_TEXT);
+      if (addr < 0) error("unknown label in mem: %s", label);
+      eynas_emit_modrm(code, code_len, code_cap, 0, ext, 5);
+      eynas_emit_u32(code, code_len, code_cap, (uint32_t)(addr + disp));
+      return;
+    }
+
+    uint8_t rm = (uint8_t)base;
+    uint8_t mod = 0;
+    if (disp == 0 && base != 5) mod = 0;
+    else if (disp >= -128 && disp <= 127) mod = 1;
+    else mod = 2;
+
+    if (has_index || base == 4) {
+      eynas_emit_modrm(code, code_len, code_cap, mod, ext, 4);
+      uint8_t sib_index = has_index ? (uint8_t)index : 4;
+      uint8_t sib_base = (uint8_t)base;
+      eynas_emit_sib(code, code_len, code_cap, (uint8_t)scale, sib_index, sib_base);
+    } else {
+      eynas_emit_modrm(code, code_len, code_cap, mod, ext, rm);
     }
 
     if (mod == 1)
@@ -2408,6 +2713,9 @@ static int eynas_est_inst_size(const eynas_instruction_t *inst) {
     return 2;
 
   if (!strcmp(inst->mnemonic, "call") || !strcmp(inst->mnemonic, "jmp")) {
+    // Indirect through register: FF /2 or FF /4 = 2 bytes
+    if (inst->operands[0].type == EYNAS_OPERAND_REGISTER)
+      return 2;
     // assume rel32
     return 5;
   }
@@ -2449,13 +2757,15 @@ static int eynas_est_inst_size(const eynas_instruction_t *inst) {
   }
 
   if (!strcmp(inst->mnemonic, "mov") && inst->operands[0].type == EYNAS_OPERAND_REGISTER && inst->operands[1].type == EYNAS_OPERAND_MEMORY) {
-    // 8B /r + ModRM/SIB/disp
-    return 1 + eynas_est_modrm_sib_disp_bytes(inst->operands[1].value);
+    // 8B /r + ModRM/SIB/disp, +1 for 0x66 prefix if 16-bit register
+    int prefix = (eynas_get_reg16_encoding(inst->operands[0].value) >= 0) ? 1 : 0;
+    return prefix + 1 + eynas_est_modrm_sib_disp_bytes(inst->operands[1].value);
   }
 
   if (!strcmp(inst->mnemonic, "mov") && inst->operands[0].type == EYNAS_OPERAND_MEMORY && inst->operands[1].type == EYNAS_OPERAND_REGISTER) {
-    // 89 /r + ModRM/SIB/disp
-    return 1 + eynas_est_modrm_sib_disp_bytes(inst->operands[0].value);
+    // 89 /r + ModRM/SIB/disp, +1 for 0x66 prefix if 16-bit register
+    int prefix = (eynas_get_reg16_encoding(inst->operands[1].value) >= 0) ? 1 : 0;
+    return prefix + 1 + eynas_est_modrm_sib_disp_bytes(inst->operands[0].value);
   }
 
   if (!strcmp(inst->mnemonic, "mov") && inst->operands[0].type == EYNAS_OPERAND_MEMORY && inst->operands[1].type == EYNAS_OPERAND_IMMEDIATE) {
@@ -2481,10 +2791,20 @@ static int eynas_est_inst_size(const eynas_instruction_t *inst) {
       return 2 + eynas_est_modrm_sib_disp_bytes(inst->operands[1].value);
   }
 
+  // not/neg/div/idiv/mul reg: F7 /ext = 2 bytes
+  if ((!strcmp(inst->mnemonic, "not") || !strcmp(inst->mnemonic, "neg") ||
+       !strcmp(inst->mnemonic, "div") || !strcmp(inst->mnemonic, "idiv") ||
+       !strcmp(inst->mnemonic, "mul")) &&
+      inst->operands[0].type == EYNAS_OPERAND_REGISTER && inst->operands[1].type == EYNAS_OPERAND_NONE)
+    return 2;
+
   // add/sub/xor/and/or/cmp reg, imm8/imm32 or reg, reg
   if ((!strcmp(inst->mnemonic, "add") || !strcmp(inst->mnemonic, "sub") || !strcmp(inst->mnemonic, "xor") ||
        !strcmp(inst->mnemonic, "and") || !strcmp(inst->mnemonic, "or") || !strcmp(inst->mnemonic, "cmp")) &&
       inst->operands[0].type == EYNAS_OPERAND_REGISTER && inst->operands[1].type == EYNAS_OPERAND_IMMEDIATE) {
+    // Check for 16-bit register: 0x66 + 0x81 /r iw = 5 bytes
+    if (eynas_get_reg16_encoding(inst->operands[0].value) >= 0)
+      return 5; // 0x66 + 0x81 + modrm + imm16
     uint32_t imm = 0;
     if (eynas_parse_imm32(inst->operands[1].value, &imm) == 0) {
       if ((int32_t)imm >= -128 && (int32_t)imm <= 127)
@@ -2504,6 +2824,29 @@ static int eynas_est_inst_size(const eynas_instruction_t *inst) {
     // 0F AF /r
     return 3;
   }
+
+  // FPU no-operand instructions (2 bytes each)
+  if (!strcmp(inst->mnemonic, "faddp") || !strcmp(inst->mnemonic, "fsubp") ||
+      !strcmp(inst->mnemonic, "fmulp") || !strcmp(inst->mnemonic, "fdivp") ||
+      !strcmp(inst->mnemonic, "fchs")  || !strcmp(inst->mnemonic, "fucompp") ||
+      !strcmp(inst->mnemonic, "fnstsw"))
+    return 2;
+
+  // fstp st0 (register form, 2 bytes)
+  if (!strcmp(inst->mnemonic, "fstp") && inst->operands[0].type == EYNAS_OPERAND_REGISTER)
+    return 2;
+
+  // sahf (1 byte)
+  if (!strcmp(inst->mnemonic, "sahf"))
+    return 1;
+
+  // FPU memory ops: 1 byte opcode + ModRM/SIB/disp
+  if ((!strcmp(inst->mnemonic, "fld")  || !strcmp(inst->mnemonic, "fst")  ||
+       !strcmp(inst->mnemonic, "fstp") || !strcmp(inst->mnemonic, "fild") ||
+       !strcmp(inst->mnemonic, "fistp")|| !strcmp(inst->mnemonic, "fnstcw") ||
+       !strcmp(inst->mnemonic, "fldcw")) &&
+      inst->operands[0].type == EYNAS_OPERAND_MEMORY)
+    return 1 + eynas_est_modrm_sib_disp_bytes(inst->operands[0].value);
 
   // typical reg/reg op
   return 6;
@@ -2629,11 +2972,30 @@ static void eynas_write_dd(uint8_t **data, size_t *len, size_t *cap, eynas_symta
     if (eynas_parse_imm32(tok, &imm) == 0) {
       eynas_emit_u32(data, len, cap, imm);
     } else {
-      int addr = eynas_symtab_lookup(symtab, tok, EYNAS_SECTION_DATA);
-      if (addr < 0) addr = eynas_symtab_lookup(symtab, tok, EYNAS_SECTION_TEXT);
+      // Handle symbol+offset or symbol-offset patterns (e.g. g_stderr+0).
+      char sym_name[128];
+      int sym_offset = 0;
+      strncpy(sym_name, tok, sizeof(sym_name) - 1);
+      sym_name[sizeof(sym_name) - 1] = 0;
+      char *plus = strchr(sym_name, '+');
+      char *minus = !plus ? strchr(sym_name, '-') : NULL;
+      if (plus) {
+        *plus = 0;
+        sym_offset = atoi(plus + 1);
+      } else if (minus && minus != sym_name) {
+        *minus = 0;
+        sym_offset = -atoi(minus + 1);
+      }
+      // Trim trailing whitespace from sym_name.
+      size_t sn = strlen(sym_name);
+      while (sn && (sym_name[sn - 1] == ' ' || sym_name[sn - 1] == '\t'))
+        sym_name[--sn] = 0;
+
+      int addr = eynas_symtab_lookup(symtab, sym_name, EYNAS_SECTION_DATA);
+      if (addr < 0) addr = eynas_symtab_lookup(symtab, sym_name, EYNAS_SECTION_TEXT);
       if (addr < 0)
         error("unknown symbol in dd: %s", tok);
-      eynas_emit_u32(data, len, cap, (uint32_t)addr);
+      eynas_emit_u32(data, len, cap, (uint32_t)(addr + sym_offset));
     }
 
     while (*p == ' ' || *p == '\t') p++;
@@ -2673,6 +3035,7 @@ static void eynas_write_dw(uint8_t **data, size_t *len, size_t *cap, eynas_symta
 static void eynas_generate(eynas_ast_t *ast, eynas_symtab_t *symtab,
                           uint8_t **out_code, size_t *out_code_size,
                           uint8_t **out_data, size_t *out_data_size,
+                          size_t *out_bss_size,
                           const char *input_path) {
   uint8_t *code = NULL;
   size_t code_len = 0, code_cap = 0;
@@ -2717,10 +3080,24 @@ static void eynas_generate(eynas_ast_t *ast, eynas_symtab_t *symtab,
     }
   }
 
+  // Compute BSS size from BSS section data definitions (no bytes emitted).
+  size_t bss_size = 0;
+  for (eynas_datadef_t *d = ast->data_defs; d; d = d->next) {
+    if (d->section != EYNAS_SECTION_BSS) continue;
+    if (!strcmp(d->directive, "resb")) {
+      bss_size += (size_t)eynas_parse_int(d->value);
+    } else if (!strcmp(d->directive, "align")) {
+      int a = eynas_parse_int(d->value);
+      if (a <= 0) a = 1;
+      while ((int)bss_size % a) bss_size++;
+    }
+  }
+
   *out_code = code;
   *out_code_size = code_len;
   *out_data = data;
   *out_data_size = data_len;
+  *out_bss_size = bss_size;
 }
 
 static eynas_ast_t *eynas_parse(const char *src, const char *input_path) {
@@ -2737,6 +3114,7 @@ static eynas_ast_t *eynas_parse(const char *src, const char *input_path) {
   // Track PCs so labels get correct offsets within their section.
   int text_pc = 0;
   int data_pc = 0;
+  int bss_pc = 0;
 
   // First pass: parse into AST nodes.
   for (;;) {
@@ -2749,6 +3127,7 @@ static eynas_ast_t *eynas_parse(const char *src, const char *input_path) {
       if (name.type != EYNAS_TOK_UNKNOWN)
         error("section expects a name");
       if (!strcmp(name.text, ".text")) cur_sec = EYNAS_SECTION_TEXT;
+      else if (!strcmp(name.text, ".bss")) cur_sec = EYNAS_SECTION_BSS;
       else cur_sec = EYNAS_SECTION_DATA;
       continue;
     }
@@ -2758,7 +3137,9 @@ static eynas_ast_t *eynas_parse(const char *src, const char *input_path) {
       if (!lab) error("out of memory");
       strncpy(lab->name, t.text, sizeof(lab->name) - 1);
       lab->section = cur_sec;
-      lab->offset = (cur_sec == EYNAS_SECTION_TEXT) ? text_pc : data_pc;
+      if (cur_sec == EYNAS_SECTION_TEXT) lab->offset = text_pc;
+      else if (cur_sec == EYNAS_SECTION_BSS) lab->offset = bss_pc;
+      else lab->offset = data_pc;
       lab->line_num = line;
       eynas_ast_add_label(ast, lab);
       continue;
@@ -2807,8 +3188,16 @@ static eynas_ast_t *eynas_parse(const char *src, const char *input_path) {
       sbuf_free(&v);
       eynas_ast_add_data(ast, d);
 
-      // Update data PC in-order so subsequent labels land correctly.
-      if (cur_sec == EYNAS_SECTION_DATA) {
+      // Update data/bss PC in-order so subsequent labels land correctly.
+      if (cur_sec == EYNAS_SECTION_BSS) {
+        if (!strcmp(d->directive, "resb")) {
+          bss_pc += eynas_parse_int(d->value);
+        } else if (!strcmp(d->directive, "align")) {
+          int a = eynas_parse_int(d->value);
+          if (a <= 0) a = 1;
+          while (bss_pc % a) bss_pc++;
+        }
+      } else if (cur_sec == EYNAS_SECTION_DATA) {
         if (!strcmp(d->directive, "db")) {
           data_pc += eynas_count_db_bytes(d->value);
         } else if (!strcmp(d->directive, "dw")) {
@@ -2860,6 +3249,7 @@ static eynas_ast_t *eynas_parse(const char *src, const char *input_path) {
           if (!strcmp(x.text, "byte")) pending_size_hint = 8;
           else if (!strcmp(x.text, "word")) pending_size_hint = 16;
           else if (!strcmp(x.text, "dword")) pending_size_hint = 32;
+          else if (!strcmp(x.text, "qword")) pending_size_hint = 64;
           continue;
         }
 
@@ -2914,10 +3304,15 @@ static eynas_ast_t *eynas_parse(const char *src, const char *input_path) {
   // Base addresses
   const int code_base = 0x00400000;
   const int data_base = code_base + (int)(((text_pc + 0x0FFF) / 0x1000) * 0x1000);
+  // BSS is placed immediately after initialized data (page-aligned in linker).
+  // Use data_pc to compute BSS base so BSS labels land after all initialized data.
+  const int bss_base = data_base + data_pc;
 
   for (eynas_label_t *l = ast->labels; l; l = l->next) {
     if (l->section == EYNAS_SECTION_TEXT)
       l->address = code_base + l->offset;
+    else if (l->section == EYNAS_SECTION_BSS)
+      l->address = bss_base + l->offset;
     else
       l->address = data_base + l->offset;
   }
@@ -3214,6 +3609,64 @@ static char *prepend_start_shim(char *intel) {
   return out;
 }
 
+/*
+ * Append EYN-OS syscall primitive stubs.
+ *
+ * All eyn_syscall3* variants share the same cdecl ABI on i386:
+ *   [ebp+8]=n  [ebp+12]=a1  [ebp+16]=a2  [ebp+20]=a3
+ * The kernel expects: eax=n, ebx=a1, ecx=a2, edx=a3.
+ */
+static char *append_syscall_stubs(char *intel) {
+  static const char sc[] =
+      "\n"
+      "section .text\n"
+      "eyn_syscall3:\n"
+      "eyn_syscall3_pii:\n"
+      "eyn_syscall3_ppi:\n"
+      "eyn_syscall3_iip:\n"
+      "eyn_syscall3_iii:\n"
+      "  push ebp\n"
+      "  mov ebp, esp\n"
+      "  push ebx\n"
+      "  mov eax, [ebp+8]\n"
+      "  mov ebx, [ebp+12]\n"
+      "  mov ecx, [ebp+16]\n"
+      "  mov edx, [ebp+20]\n"
+      "  int 0x80\n"
+      "  pop ebx\n"
+      "  leave\n"
+      "  ret\n"
+      "\n"
+      "eyn_syscall1:\n"
+      "  push ebp\n"
+      "  mov ebp, esp\n"
+      "  push ebx\n"
+      "  mov eax, [ebp+8]\n"
+      "  mov ebx, [ebp+12]\n"
+      "  int 0x80\n"
+      "  pop ebx\n"
+      "  leave\n"
+      "  ret\n"
+      "\n"
+      "eyn_syscall0:\n"
+      "  push ebp\n"
+      "  mov ebp, esp\n"
+      "  mov eax, [ebp+8]\n"
+      "  int 0x80\n"
+      "  leave\n"
+      "  ret\n";
+
+  size_t sc_len = strlen(sc);
+  size_t intel_len = intel ? strlen(intel) : 0;
+  char *out = calloc(1, intel_len + sc_len + 1);
+  if (!out) error("out of memory");
+  if (intel_len) memcpy(out, intel, intel_len);
+  memcpy(out + intel_len, sc, sc_len);
+  out[intel_len + sc_len] = 0;
+  free(intel);
+  return out;
+}
+
 // ------------------------
 // Public entrypoint
 // ------------------------
@@ -3238,6 +3691,10 @@ int eynos_assemble_uelf_from_file(const char *input_path, const char *output_pat
   int needs_getdents = source_references_call(src, "getdents") && !source_defines_label(src, "getdents");
   int needs_writefile = source_references_call(src, "writefile") && !source_defines_label(src, "writefile");
 
+  /* EYN-OS libc syscall primitives — needed when compiling userland
+     programs that include libc source (e.g. DOOM unity build). */
+  int needs_syscall3 = source_references_call(src, "eyn_syscall3") && !source_defines_label(src, "eyn_syscall3");
+
   char *intel = translate_gas_to_intel(src);
   free(src);
 
@@ -3250,6 +3707,9 @@ int eynos_assemble_uelf_from_file(const char *input_path, const char *output_pat
   if (needs_printf || needs_puts || needs_getkey || needs_exit || needs_read || needs_write || needs_strlen ||
       needs_open || needs_close || needs_getdents || needs_writefile)
     intel = append_minimal_runtime(intel);
+
+  if (needs_syscall3)
+    intel = append_syscall_stubs(intel);
 
   eynas_ast_t *ast = eynas_parse(intel, input_path);
 
@@ -3271,8 +3731,9 @@ int eynos_assemble_uelf_from_file(const char *input_path, const char *output_pat
   uint8_t *data = NULL;
   size_t code_size = 0;
   size_t data_size = 0;
+  size_t bss_size = 0;
 
-  eynas_generate(ast, &symtab, &code, &code_size, &data, &data_size, input_path);
+  eynas_generate(ast, &symtab, &code, &code_size, &data, &data_size, &bss_size, input_path);
 
   eynos_link_config_t cfg;
   eynos_link_config_init(&cfg);
@@ -3286,6 +3747,7 @@ int eynos_assemble_uelf_from_file(const char *input_path, const char *output_pat
   cfg.text.size = (uint32_t)code_size;
   cfg.rodata.data = data;
   cfg.rodata.size = (uint32_t)data_size;
+  cfg.bss_size = (uint32_t)bss_size;
 
   // Add a minimal symbol set (optional): _start
   (void)eynos_link_add_symbol;

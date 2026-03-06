@@ -141,8 +141,8 @@ int eynos_link_write_uelf(const eynos_link_config_t *cfg, const char *output_pat
   phdr[1].p_vaddr = (Elf32_Addr)cfg->rodata_vaddr;
   phdr[1].p_paddr = (Elf32_Addr)cfg->rodata_vaddr;
   phdr[1].p_filesz = (Elf32_Word)rodata_size;
-  phdr[1].p_memsz  = (Elf32_Word)rodata_size;
-  phdr[1].p_flags = PF_R;
+  phdr[1].p_memsz  = (Elf32_Word)(rodata_size + cfg->bss_size);
+  phdr[1].p_flags = PF_R | PF_W;
   phdr[1].p_align = PAGE_SIZE;
 
   Elf32_Shdr shdr[6];
